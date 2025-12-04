@@ -1,0 +1,28 @@
+site_name: RC Transmitter Documentation
+site_description: Documentation for the Arduino-based RC Transmitter
+site_author: Prabhagaran
+theme:
+  name: material
+nav:
+  - Home: index.md
+  - Overview: overview.md
+  - Hardware:
+      - Wiring: hardware/wiring.md
+      - Components: hardware/components.md
+      - PCB: hardware/pcb.md
+  - Firmware:
+      - Architecture: firmware/architecture.md
+      - Code: firmware/transmitter-code.md
+      - Protocol: firmware/protocol.md
+  - Testing:
+      - Calibration: testing/calibration.md
+      - Range Test: testing/range-test.md
+  - Development:
+      - TODO: development/todo.md
+      - Changelog: development/changelog.md
+plugins:
+  - search
+markdown_extensions:
+  - admonition
+  - toc:
+      permalink: true
