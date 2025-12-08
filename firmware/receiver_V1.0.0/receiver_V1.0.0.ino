@@ -1,7 +1,7 @@
 // ==== Uncomment to enable debugging on Serial ====
  #define DEBUG
 
-// RX_with_ack + Servo Output
+// RX_with_ack + Servo Output + Failsafe
 
 #include <SPI.h>
 #include <nRF24L01.h>
@@ -24,7 +24,17 @@ const uint64_t pipeAddress = 0xF0F0F0F0E1LL;
 
 Servo servo0, servo1, servo2, servo3;
 
-// ----- Packet Structures -----
+// ----- Failsafe config -----
+const unsigned long FAILSAFE_TIMEOUT = 300;   // ms without packets -> failsafe
+unsigned long lastPacketTime = 0;
+bool failsafeActive = false;
+
+// Failsafe channel values (-1000..+1000)
+const int16_t FS_CH0 = 0;     // e.g. steering center
+const int16_t FS_CH1 = 0;     // e.g. throttle neutral
+const int16_t FS_CH2 = 0;
+const int16_t FS_CH3 = 0;
+
 struct Packet {
   uint8_t version;
   uint8_t device_id;
@@ -37,7 +47,7 @@ struct TelemetryAck {
   uint16_t seq;
   uint16_t battery_mV;
   uint8_t  rssi_est;
-  uint8_t  status;
+  uint8_t  status;   // bit0=link OK, bit1=failsafe
 } __attribute__((packed));
 
 Packet pktRecv;
@@ -68,6 +78,20 @@ int rcToUs(int16_t v) {
 uint8_t measure_link_quality_estimate() { return 200; }
 uint16_t measure_battery_mV() { return 7400; }
 
+// ----- Apply failsafe positions -----
+void applyFailsafe() {
+  failsafeActive = true;
+
+  servo0.writeMicroseconds(rcToUs(FS_CH0));
+  servo1.writeMicroseconds(rcToUs(FS_CH1));
+  servo2.writeMicroseconds(rcToUs(FS_CH2));
+  servo3.writeMicroseconds(rcToUs(FS_CH3));
+
+#ifdef DEBUG
+  Serial.println("** FAILSAFE ACTIVE: no packets **");
+#endif
+}
+
 // ================== SETUP ==================
 void setup() {
 #ifdef DEBUG
@@ -81,6 +105,7 @@ void setup() {
   servo2.attach(SERVO2_PIN);
   servo3.attach(SERVO3_PIN);
 
+  // Start centered
   servo0.writeMicroseconds(1500);
   servo1.writeMicroseconds(1500);
   servo2.writeMicroseconds(1500);
@@ -101,6 +126,8 @@ void setup() {
   ackOut.rssi_est = 0;
   ackOut.status = 0;
 
+  lastPacketTime = millis();
+
 #ifdef DEBUG
   Serial.println("RX ready.");
 #endif
@@ -108,83 +135,96 @@ void setup() {
 
 // ================== LOOP ==================
 void loop() {
-  if (!radio.available()) return;
+  // 1) Handle incoming packets (if any)
+  if (radio.available()) {
+    uint8_t pipeNum;
+    radio.available(&pipeNum);
+    uint8_t len = radio.getDynamicPayloadSize();
 
-  uint8_t pipeNum;
-  radio.available(&pipeNum);
-  uint8_t len = radio.getDynamicPayloadSize();
-
-  if (len > sizeof(Packet)) {
-    uint8_t dump[len];
-    radio.read(dump, len);
+    if (len > sizeof(Packet)) {
+      uint8_t dump[len];
+      radio.read(dump, len);
 #ifdef DEBUG
-    Serial.print("RX: Oversized payload "); Serial.println(len);
+      Serial.print("RX: Oversized payload ");
+      Serial.println(len);
 #endif
-    return;
+    } else {
+      memset(&pktRecv, 0, sizeof(pktRecv));
+      radio.read(&pktRecv, len);
+
+      size_t crc_offset = offsetof(Packet, crc);
+      size_t compute_len = min(crc_offset, (size_t)len);
+      uint8_t *raw = (uint8_t*)&pktRecv;
+
+      uint16_t computed_crc = crc16_ccitt(raw, compute_len);
+
+      uint16_t received_crc = 0xFFFF;
+      if (len >= crc_offset + 2) {
+        received_crc = raw[crc_offset] | (raw[crc_offset + 1] << 8);
+      }
+
+      bool crc_ok = (computed_crc == received_crc);
+
+#ifdef DEBUG
+      Serial.print("RX len="); Serial.print(len);
+      Serial.print(" CRC=0x"); Serial.print(received_crc, HEX);
+      Serial.print(" calc=0x"); Serial.print(computed_crc, HEX);
+      Serial.print(" -> ");
+      Serial.println(crc_ok ? "OK" : "BAD");
+#endif
+
+      if (crc_ok) {
+        // Valid packet -> update lastPacketTime, clear failsafe
+        lastPacketTime = millis();
+        failsafeActive = false;
+
+#ifdef DEBUG
+        Serial.print("Channels: ");
+        for (int i = 0; i < pktRecv.channel_count; i++) {
+          Serial.print(pktRecv.channels[i]);
+          Serial.print(i < pktRecv.channel_count - 1 ? ", " : "");
+        }
+        Serial.println();
+#endif
+
+        // Drive servos from channels
+        int16_t ch0 = pktRecv.channels[0];
+        int16_t ch1 = pktRecv.channels[1];
+        int16_t ch2 = pktRecv.channels[2];
+        int16_t ch3 = pktRecv.channels[3];
+
+        servo0.writeMicroseconds(rcToUs(ch0));
+        servo1.writeMicroseconds(rcToUs(ch1));
+        servo2.writeMicroseconds(rcToUs(ch2));
+        servo3.writeMicroseconds(rcToUs(ch3));
+
+        // Prepare ACK telemetry
+        ackOut.seq        = seq_counter++;
+        ackOut.battery_mV = measure_battery_mV();
+        ackOut.rssi_est   = measure_link_quality_estimate();
+
+        // status: bit0 = link OK, bit1 = failsafe
+        ackOut.status = 0;
+        ackOut.status |= (1 << 0);            // link OK
+        if (failsafeActive) ackOut.status |= (1 << 1);
+
+        uint8_t p = (pipeNum <= 5) ? pipeNum : 0;
+        radio.writeAckPayload(p, &ackOut, sizeof(ackOut));
+
+#ifdef DEBUG
+        Serial.print("ACK sent seq=");
+        Serial.print(ackOut.seq);
+        Serial.print(" status=0x");
+        Serial.println(ackOut.status, HEX);
+#endif
+      }
+    }
   }
 
-  memset(&pktRecv, 0, sizeof(pktRecv));
-  radio.read(&pktRecv, len);
-
-  size_t crc_offset = offsetof(Packet, crc);
-  size_t compute_len = min(crc_offset, (size_t)len);
-  uint8_t *raw = (uint8_t*)&pktRecv;
-
-  uint16_t computed_crc = crc16_ccitt(raw, compute_len);
-
-  uint16_t received_crc = 0xFFFF;
-  if (len >= crc_offset + 2) {
-    received_crc = raw[crc_offset] | (raw[crc_offset + 1] << 8);
+  // 2) Check for failsafe timeout
+  if (!failsafeActive && (millis() - lastPacketTime > FAILSAFE_TIMEOUT)) {
+    applyFailsafe();
+    // ackOut.status will be set with failsafe flag next time a packet arrives (or you can also
+    // send some standalone telemetry if you design it that way)
   }
-
-  bool crc_ok = (computed_crc == received_crc);
-
-#ifdef DEBUG
-  Serial.print("RX len="); Serial.print(len);
-  Serial.print(" CRC=0x"); Serial.print(received_crc, HEX);
-  Serial.print(" calc=0x"); Serial.print(computed_crc, HEX);
-  Serial.print(" -> ");
-  Serial.println(crc_ok ? "OK" : "BAD");
-#endif
-
-  if (!crc_ok) {
-#ifdef DEBUG
-    Serial.println("Bad CRC, dropping.");
-#endif
-    return;
-  }
-
-  // ----- Print channels -----
-#ifdef DEBUG
-  Serial.print("Channels: ");
-  for (int i = 0; i < pktRecv.channel_count; i++) {
-    Serial.print(pktRecv.channels[i]);
-    Serial.print(i < pktRecv.channel_count - 1 ? ", " : "");
-  }
-  Serial.println();
-#endif
-
-  // ----- Drive servos -----
-  int16_t ch0 = pktRecv.channels[0];
-  int16_t ch1 = pktRecv.channels[1];
-  int16_t ch2 = pktRecv.channels[2];
-  int16_t ch3 = pktRecv.channels[3];
-
-  servo0.writeMicroseconds(rcToUs(ch0));
-  servo1.writeMicroseconds(rcToUs(ch1));
-  servo2.writeMicroseconds(rcToUs(ch2));
-  servo3.writeMicroseconds(rcToUs(ch3));
-
-  // ----- Prepare ACK -----
-  ackOut.seq = seq_counter++;
-  ackOut.battery_mV = measure_battery_mV();
-  ackOut.rssi_est = measure_link_quality_estimate();
-  ackOut.status = 0;
-
-  uint8_t p = (pipeNum <= 5) ? pipeNum : 0;
-  radio.writeAckPayload(p, &ackOut, sizeof(ackOut));
-
-#ifdef DEBUG
-  Serial.print("ACK sent seq="); Serial.println(ackOut.seq);
-#endif
 }
