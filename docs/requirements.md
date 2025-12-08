@@ -110,46 +110,7 @@ status   (1B) // bitmask: link OK / failsafe / low batt / ID mismatch
 
 ---
 
-## TODO List
-
-### Completed Tasks
-
-* Basic NRF24 communication established
-* Structured packet with CRC implemented
-* ACK payload telemetry implemented
-* Requirements document created (Markdown + PDF)
-* Canvas document created for project tracking
-
-### High Priority Tasks
-
-1. Implement real telemetry (ADC battery measurement, real RSSI heuristic)
-2. Add TX sequence number (`seq_tx`) and echo via ACK
-3. Implement PWM servo/ESC outputs on RX
-4. Implement RX failsafe (150ms timeout)
-
-### Medium Priority Tasks
-
-5. Add binding system (TX UID + vehicle ID storage)
-6. Add EEPROM storage on TX (calibration, model ID, UID)
-7. Add EEPROM storage on RX (bound UID, failsafe defaults)
-
-### UI Tasks (OLED)
-
-8. Implement OLED live view (channels, telemetry, link status)
-9. Add calibration menu
-10. Add model selection menu
-
-### Future Features
-
-11. Vehicle profiles (mixes, expo, endpoints)
-12. Lighting/accessory channels
-13. Telemetry alarms (low battery, failsafe)
-14. SD card logging
-15. Multi-protocol expansion (ESP-NOW/Sub-GHz)
-
-## Notes
-
-Safety-critical: always validate CRC + ID before servo output. (pick one or more)
+## 5. Recommended next steps (pick one or more)
 
 * **A. Real battery ADC on RX** — replace simulated battery values with ADC readings and scale with voltage divider.
 * **B. Add seq_tx in main packet & echo in ACK** — correlates ACKs to specific TX packets to compute packet loss/latency.
