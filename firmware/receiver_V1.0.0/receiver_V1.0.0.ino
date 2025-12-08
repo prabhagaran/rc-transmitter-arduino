@@ -1,12 +1,13 @@
-// RX_packet_crc.ino
+// RX_with_ack.ino
+// Receiver: validates packet, then sends ACK telemetry payload back to transmitter.
+
 #include <SPI.h>
 #include <nRF24L01.h>
 #include <RF24.h>
-#include <stddef.h> // for offsetof
+#include <stddef.h>
 
 #define CE_PIN 7
 #define CSN_PIN 8
-
 RF24 radio(CE_PIN, CSN_PIN);
 const uint64_t pipeAddress = 0xF0F0F0F0E1LL;
 #define MAX_CHANNELS 8
@@ -19,9 +20,19 @@ struct Packet {
   uint16_t crc;
 } __attribute__((packed));
 
-Packet pktRecv;
+struct TelemetryAck {
+  uint16_t seq;
+  uint16_t battery_mV;
+  uint8_t rssi_est;
+  uint8_t status;
+} __attribute__((packed));
 
-// CRC-16-CCITT (same as TX)
+Packet pktRecv;
+TelemetryAck ackOut;
+
+uint16_t seq_counter = 0;
+
+// CRC-16-CCITT (0x1021), init 0xFFFF
 uint16_t crc16_ccitt(const uint8_t *data, size_t len) {
   uint16_t crc = 0xFFFF;
   while (len--) {
@@ -40,51 +51,67 @@ void setup() {
   radio.setPALevel(RF24_PA_LOW);
   radio.setDataRate(RF24_1MBPS);
   radio.enableDynamicPayloads();
+  radio.enableAckPayload(); // allow writing ack payloads
   radio.setRetries(5, 15);
   radio.openReadingPipe(0, pipeAddress);
   radio.startListening();
 
-  Serial.println("RX (structured packet) ready");
+  // init ack structure
+  ackOut.seq = 0;
+  ackOut.battery_mV = 0;
+  ackOut.rssi_est = 0;
+  ackOut.status = 0;
+
+  Serial.println("RX w/ ACK ready");
+}
+
+uint8_t measure_link_quality_estimate() {
+  // crude placeholder. RF24 doesn't expose hardware RSSI.
+  // You can infer quality from observed packet timing, LQI heuristics or ACK success rates.
+  // For demo, return 200 (good).
+  return 200;
+}
+
+uint16_t measure_battery_mV() {
+  // Demo: Simulate reading battery voltage via an analog pin if available.
+  // Replace this with real ADC reading and scaling as needed.
+  // Example: return 7400 for 7.4V pack
+  // If you have a voltage divider connect to A0 and compute real voltage.
+  return 7400; // simulated 7.4V
 }
 
 void loop() {
   if (radio.available()) {
-    // read dynamic payload (could be whole Packet)
+    uint8_t pipeNum;
+    // read pipe number that has data (optional)
+    bool got = radio.available(&pipeNum);
     uint8_t len = radio.getDynamicPayloadSize();
     if (len > sizeof(Packet)) {
-      // Too large: discard or read min
-      Serial.print("Payload too big (");
-      Serial.print(len);
-      Serial.println("). Discarding.");
+      // discard if too large
       uint8_t dump[len];
       radio.read(dump, len);
+      Serial.print("RX: payload too big (");
+      Serial.print(len);
+      Serial.println("). Discard.");
       return;
     }
 
-    // Read into our struct buffer
+    // read payload into pktRecv (zero rest)
+    memset(&pktRecv, 0, sizeof(pktRecv));
     radio.read(&pktRecv, len);
 
-    // For CRC we need to compute over the bytes before crc field.
+    // compute CRC over bytes before crc field (up to offsetof(Packet, crc))
     size_t crc_offset = offsetof(Packet, crc);
-    // However payload may be smaller (if sender used fewer bytes). Ensure we only compute over what's present
-    size_t compute_len = min(crc_offset, (size_t)len); // bytes available before CRC
+    size_t compute_len = min(crc_offset, (size_t)len);
     uint8_t *raw = (uint8_t*)&pktRecv;
     uint16_t computed = crc16_ccitt(raw, compute_len);
 
-    // Extract received CRC if payload contains it
-    uint16_t received_crc = 0;
+    // extract received CRC if present
+    uint16_t received_crc = 0xFFFF;
     if (len >= (int)(crc_offset + sizeof(uint16_t))) {
-      // CRC bytes are present at end of payload; read safely (platform endian matches between TX/RX)
-      // copy two bytes to avoid unaligned issues
-      uint8_t b0 = raw[crc_offset];
-      uint8_t b1 = raw[crc_offset + 1];
-      received_crc = (uint16_t)(b0 | (b1 << 8)); // little-endian AVR ordering
-    } else {
-      // No CRC field present
-      received_crc = 0xFFFF; // mark as invalid
+      received_crc = (uint16_t)(raw[crc_offset] | (raw[crc_offset + 1] << 8)); // little-endian
     }
 
-    // Validate CRC
     bool crc_ok = (received_crc == computed);
 
     Serial.print("RX len=");
@@ -95,7 +122,7 @@ void loop() {
     Serial.print(pktRecv.device_id);
     Serial.print(" ch=");
     Serial.print(pktRecv.channel_count);
-    Serial.print("  CRCrecv=0x");
+    Serial.print(" CRCrcv=0x");
     Serial.print(received_crc, HEX);
     Serial.print(" CRCcalc=0x");
     Serial.print(computed, HEX);
@@ -103,7 +130,7 @@ void loop() {
     Serial.println(crc_ok ? "OK" : "BAD");
 
     if (crc_ok) {
-      // print channels (only up to channel_count and within bounds)
+      // (Optional) do something with channels here (map to servos)
       int cc = pktRecv.channel_count;
       if (cc > MAX_CHANNELS) cc = MAX_CHANNELS;
       Serial.print("Channels: ");
@@ -112,10 +139,32 @@ void loop() {
         if (i < cc - 1) Serial.print(", ");
       }
       Serial.println();
-      // TODO: map to servos / ESC outputs
+
+      // Prepare ACK telemetry payload
+      ackOut.seq = seq_counter++;
+      ackOut.battery_mV = measure_battery_mV();
+      ackOut.rssi_est = measure_link_quality_estimate();
+      ackOut.status = 0; // flags: bit0=OK, bit1=LOWBATT, etc. set as needed
+
+      // Write ACK payload back to transmitter on the same pipe we received from.
+      // We retrieved 'pipeNum' above from radio.available(&pipeNum).
+      // Use that pipe number for writeAckPayload.
+      // If pipeNum is out of range, default to pipe 0.
+      uint8_t p = (pipeNum <= 5) ? pipeNum : 0;
+      bool wrote = radio.writeAckPayload(p, &ackOut, sizeof(ackOut));
+      if (!wrote) {
+        Serial.println("Failed to queue ACK payload");
+      } else {
+        Serial.print("Queued ACK: seq=");
+        Serial.print(ackOut.seq);
+        Serial.print(" batt=");
+        Serial.print(ackOut.battery_mV);
+        Serial.print(" rssi=");
+        Serial.println(ackOut.rssi_est);
+      }
     } else {
-      // Optionally ignore corrupted packet
-      Serial.println("Dropping corrupted packet.");
+      Serial.println("Corrupted packet: dropping");
+      // Optionally you can still reply with NACK-like smaller payload via dynamic ack or flags
     }
   }
 }
