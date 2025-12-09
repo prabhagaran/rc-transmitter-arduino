@@ -1,130 +1,98 @@
-// ===== RC Menu + Channel Reverse + Endpoints + EEPROM (Serial test) =====
+// ===== RC Menu + Reverse + EP + Subtrim + EEPROM =====
 
 #include <EEPROM.h>
 
 // Buttons
-#define BUTTON_LEFT  2   // - or previous
-#define BUTTON_RIGHT 3   // + or next
-#define BUTTON_SEL   4   // select / enter
-#define BUTTON_BACK  5   // back / exit
+#define BUTTON_LEFT  2
+#define BUTTON_RIGHT 3
+#define BUTTON_SEL   4
+#define BUTTON_BACK  5
 
 byte leftButtonState  = 7;
 byte rightButtonState = 7;
 byte selButtonState   = 7;
 byte backButtonState  = 7;
 
-// Debounced Rising Edge macro (DIY999 style)
+// Debounced Rising Edge
 #define DRE(signal, state) (state = ((state << 1) | (signal & 1)) & 15) == 7
 
-// ---- Channels for reverse settings ----
+// ---- Channels ----
 const int NUM_CHANNELS = 4;
-bool chReverse[NUM_CHANNELS] = {false, false, false, false};  // false=NORMAL, true=REVERSED
+bool    chReverse[NUM_CHANNELS] = {false, false, false, false};
+uint8_t chEP[NUM_CHANNELS]      = {100, 100, 100, 100};
+int8_t  chSubtrim[NUM_CHANNELS] = {0, 0, 0, 0};   // NEW
 
-// ---- Endpoint settings (percent: 0..125) ----
-uint8_t steerEP    = 100;   // steering endpoint %
-uint8_t throttleEP = 100;   // throttle endpoint %
-
-// ---- EEPROM config struct ----
+// ---- EEPROM ----
 struct Config {
   uint8_t magic;
   bool    chReverse[NUM_CHANNELS];
-  uint8_t steerEP;
-  uint8_t throttleEP;
+  uint8_t chEP[NUM_CHANNELS];
+  int8_t  chSubtrim[NUM_CHANNELS];
 };
 
 const uint8_t CONFIG_MAGIC = 0x42;
 const int EEPROM_ADDR = 0;
 
-// ---- Menu state ----
+// ---- Menu ----
 bool inMenu = false;
+int  menuIndex = 0;
+int  chIndex   = 0;
 
-// top-level menu items
 const char* menuItems[] = {
   "Channel Reverse",
-  "Steering End Point",
-  "Throttle End Point",
+  "End Points",
+  "Subtrim",
   "Save & Exit"
 };
 const int MENU_COUNT = sizeof(menuItems) / sizeof(menuItems[0]);
-int menuIndex = 0;
 
-// menu levels / modes
 enum MenuLevel {
   MENU_TOP,
   MENU_CH_REVERSE,
-  MENU_EP_STEER,
-  MENU_EP_THROTTLE
+  MENU_EP_LIST,
+  MENU_EP_EDIT,
+  MENU_SUBTRIM_LIST,
+  MENU_SUBTRIM_EDIT
 };
 
 MenuLevel menuLevel = MENU_TOP;
 
-// channel reverse submenu state
-int chRevIndex = 0;  // which channel selected (0..NUM_CHANNELS-1)
-
-// ---------- EEPROM helpers ----------
+// ---------- EEPROM ----------
 void loadConfig() {
   Config cfg;
   EEPROM.get(EEPROM_ADDR, cfg);
 
   if (cfg.magic != CONFIG_MAGIC) {
-    // no valid config -> defaults
-    Serial.println("EEPROM: No valid config, using defaults.");
     for (int i = 0; i < NUM_CHANNELS; i++) {
       chReverse[i] = false;
+      chEP[i] = 100;
+      chSubtrim[i] = 0;
     }
-    steerEP    = 100;
-    throttleEP = 100;
-
-    // save defaults
     cfg.magic = CONFIG_MAGIC;
-    for (int i = 0; i < NUM_CHANNELS; i++) {
-      cfg.chReverse[i] = chReverse[i];
-    }
-    cfg.steerEP    = steerEP;
-    cfg.throttleEP = throttleEP;
+    memcpy(cfg.chReverse, chReverse, sizeof(chReverse));
+    memcpy(cfg.chEP, chEP, sizeof(chEP));
+    memcpy(cfg.chSubtrim, chSubtrim, sizeof(chSubtrim));
     EEPROM.put(EEPROM_ADDR, cfg);
-    Serial.println("EEPROM: Defaults saved.");
+    Serial.println("EEPROM: defaults created");
   } else {
-    // load from EEPROM
-    for (int i = 0; i < NUM_CHANNELS; i++) {
-      chReverse[i] = cfg.chReverse[i];
-    }
-    steerEP    = cfg.steerEP;
-    throttleEP = cfg.throttleEP;
-
-    Serial.println("EEPROM: Config loaded.");
+    memcpy(chReverse, cfg.chReverse, sizeof(chReverse));
+    memcpy(chEP, cfg.chEP, sizeof(chEP));
+    memcpy(chSubtrim, cfg.chSubtrim, sizeof(chSubtrim));
+    Serial.println("EEPROM: config loaded");
   }
-
-  // Print loaded values
-  Serial.println("Current config:");
-  for (int i = 0; i < NUM_CHANNELS; i++) {
-    Serial.print("  CH");
-    Serial.print(i + 1);
-    Serial.print(" reverse: ");
-    Serial.println(chReverse[i] ? "REVERSED" : "NORMAL");
-  }
-  Serial.print("  Steering EP : ");
-  Serial.print(steerEP);
-  Serial.println("%");
-  Serial.print("  Throttle EP : ");
-  Serial.print(throttleEP);
-  Serial.println("%");
 }
 
 void saveConfig() {
   Config cfg;
   cfg.magic = CONFIG_MAGIC;
-  for (int i = 0; i < NUM_CHANNELS; i++) {
-    cfg.chReverse[i] = chReverse[i];
-  }
-  cfg.steerEP    = steerEP;
-  cfg.throttleEP = throttleEP;
-
+  memcpy(cfg.chReverse, chReverse, sizeof(chReverse));
+  memcpy(cfg.chEP, chEP, sizeof(chEP));
+  memcpy(cfg.chSubtrim, chSubtrim, sizeof(chSubtrim));
   EEPROM.put(EEPROM_ADDR, cfg);
-  Serial.println("\nEEPROM: Config saved.");
+  Serial.println("Saved to EEPROM");
 }
 
-// ---------- Display helpers ----------
+// ---------- Display ----------
 void showTopMenu() {
   Serial.print("> ");
   Serial.print(menuIndex + 1);
@@ -132,192 +100,120 @@ void showTopMenu() {
   Serial.println(menuItems[menuIndex]);
 }
 
-void showChannelReverse() {
-  Serial.print("\n[Channel Reverse]\n");
-  Serial.print("Channel: CH");
-  Serial.print(chRevIndex + 1);
-  Serial.print("  State: ");
-  Serial.println(chReverse[chRevIndex] ? "REVERSED" : "NORMAL");
-
-  Serial.println("LEFT/RIGHT: change channel");
-  Serial.println("SELECT    : toggle normal/reversed");
-  Serial.println("BACK      : return to main menu");
+void showSubtrimList() {
+  Serial.println("\n[Subtrim]");
+  for (int i = 0; i < NUM_CHANNELS; i++) {
+    Serial.print(i == chIndex ? "> " : "  ");
+    Serial.print("CH");
+    Serial.print(i + 1);
+    Serial.print(" : ");
+    Serial.println(chSubtrim[i]);
+  }
+  Serial.println("LEFT/RIGHT: select");
+  Serial.println("SELECT    : edit");
+  Serial.println("BACK      : main menu");
 }
 
-void showSteerEP() {
-  Serial.print("\n[Steering End Point]\n");
-  Serial.print("Steering EP: ");
-  Serial.print(steerEP);
-  Serial.println("%");
-  Serial.println("LEFT  : -1%");
-  Serial.println("RIGHT : +1%");
-  Serial.println("BACK  : return to main menu");
-}
-
-void showThrottleEP() {
-  Serial.print("\n[Throttle End Point]\n");
-  Serial.print("Throttle EP: ");
-  Serial.print(throttleEP);
-  Serial.println("%");
-  Serial.println("LEFT  : -1%");
-  Serial.println("RIGHT : +1%");
-  Serial.println("BACK  : return to main menu");
+void showSubtrimEdit() {
+  Serial.print("\n[Edit CH");
+  Serial.print(chIndex + 1);
+  Serial.println(" Subtrim]");
+  Serial.print("Value: ");
+  Serial.println(chSubtrim[chIndex]);
+  Serial.println("LEFT:-  RIGHT:+  BACK:Done");
 }
 
 // ---------- Setup ----------
 void setup() {
   Serial.begin(115200);
 
-  pinMode(BUTTON_LEFT,  INPUT_PULLUP);
+  pinMode(BUTTON_LEFT, INPUT_PULLUP);
   pinMode(BUTTON_RIGHT, INPUT_PULLUP);
-  pinMode(BUTTON_SEL,   INPUT_PULLUP);
-  pinMode(BUTTON_BACK,  INPUT_PULLUP);
+  pinMode(BUTTON_SEL, INPUT_PULLUP);
+  pinMode(BUTTON_BACK, INPUT_PULLUP);
 
   loadConfig();
-
-  Serial.println("\nSystem Ready.");
-  Serial.println("Press SELECT to enter menu.");
+  Serial.println("Press SELECT to enter menu");
 }
 
 // ---------- Loop ----------
 void loop() {
-  // Read buttons (invert because INPUT_PULLUP)
-  bool leftPressed  = !digitalRead(BUTTON_LEFT);
-  bool rightPressed = !digitalRead(BUTTON_RIGHT);
-  bool selPressed   = !digitalRead(BUTTON_SEL);
-  bool backPressed  = !digitalRead(BUTTON_BACK);
+  bool L = !digitalRead(BUTTON_LEFT);
+  bool R = !digitalRead(BUTTON_RIGHT);
+  bool S = !digitalRead(BUTTON_SEL);
+  bool B = !digitalRead(BUTTON_BACK);
 
   if (!inMenu) {
-    // --------- NOT in menu: only SELECT enters menu ---------
-    if (DRE(selPressed, selButtonState)) {
+    if (DRE(S, selButtonState)) {
       inMenu = true;
-      menuLevel = MENU_TOP;
       menuIndex = 0;
-      Serial.println("\n=== MENU ENTERED ===");
+      menuLevel = MENU_TOP;
+      Serial.println("\n=== MENU ===");
       showTopMenu();
     }
-  } else {
-    // --------- IN MENU ---------
-    if (menuLevel == MENU_TOP) {
+    return;
+  }
 
-      // BACK: exit menu
-      if (DRE(backPressed, backButtonState)) {
-        inMenu = false;
-        Serial.println("\n=== MENU EXITED ===");
-      }
-
-      // RIGHT: next item
-      if (DRE(rightPressed, rightButtonState)) {
-        menuIndex++;
-        if (menuIndex >= MENU_COUNT) menuIndex = 0;
+  // ---------- TOP MENU ----------
+  if (menuLevel == MENU_TOP) {
+    if (DRE(B, backButtonState)) {
+      inMenu = false;
+      Serial.println("Exit menu");
+    }
+    if (DRE(R, rightButtonState)) {
+      menuIndex = (menuIndex + 1) % MENU_COUNT;
+      showTopMenu();
+    }
+    if (DRE(L, leftButtonState)) {
+      menuIndex = (menuIndex + MENU_COUNT - 1) % MENU_COUNT;
+      showTopMenu();
+    }
+    if (DRE(S, selButtonState)) {
+      chIndex = 0;
+      if (menuIndex == 2) {
+        menuLevel = MENU_SUBTRIM_LIST;
+        showSubtrimList();
+      } else if (menuIndex == 3) {
+        saveConfig();
+        menuIndex = 0;
         showTopMenu();
-      }
-
-      // LEFT: previous item
-      if (DRE(leftPressed, leftButtonState)) {
-        menuIndex--;
-        if (menuIndex < 0) menuIndex = MENU_COUNT - 1;
-        showTopMenu();
-      }
-
-      // SELECT: enter submenu / action
-      if (DRE(selPressed, selButtonState)) {
-        if (menuIndex == 0) {
-          // Channel Reverse submenu
-          menuLevel = MENU_CH_REVERSE;
-          chRevIndex = 0;
-          showChannelReverse();
-        } else if (menuIndex == 1) {
-          // Steering EP submenu
-          menuLevel = MENU_EP_STEER;
-          showSteerEP();
-        } else if (menuIndex == 2) {
-          // Throttle EP submenu
-          menuLevel = MENU_EP_THROTTLE;
-          showThrottleEP();
-        } else if (menuIndex == 3) {
-          // Save & Exit
-          saveConfig();
-          inMenu = false;
-          Serial.println("=== MENU EXITED ===");
-        }
-      }
-
-    } else if (menuLevel == MENU_CH_REVERSE) {
-      // --------- CHANNEL REVERSE SUBMENU ---------
-
-      // BACK → return to top menu
-      if (DRE(backPressed, backButtonState)) {
-        menuLevel = MENU_TOP;
-        Serial.println("\nBack to MAIN MENU");
-        showTopMenu();
-      }
-
-      // RIGHT → next channel
-      if (DRE(rightPressed, rightButtonState)) {
-        chRevIndex++;
-        if (chRevIndex >= NUM_CHANNELS) chRevIndex = 0;
-        showChannelReverse();
-      }
-
-      // LEFT → previous channel
-      if (DRE(leftPressed, leftButtonState)) {
-        chRevIndex--;
-        if (chRevIndex < 0) chRevIndex = NUM_CHANNELS - 1;
-        showChannelReverse();
-      }
-
-      // SELECT → toggle NORMAL/REVERSED
-      if (DRE(selPressed, selButtonState)) {
-        chReverse[chRevIndex] = !chReverse[chRevIndex];
-        showChannelReverse();
-      }
-
-    } else if (menuLevel == MENU_EP_STEER) {
-      // --------- STEERING EP SUBMENU ---------
-
-      // BACK → return to top menu
-      if (DRE(backPressed, backButtonState)) {
-        menuLevel = MENU_TOP;
-        Serial.println("\nBack to MAIN MENU");
-        showTopMenu();
-      }
-
-      // LEFT → -1%
-      if (DRE(leftPressed, leftButtonState)) {
-        if (steerEP > 0) steerEP--;
-        showSteerEP();
-      }
-
-      // RIGHT → +1%
-      if (DRE(rightPressed, rightButtonState)) {
-        if (steerEP < 125) steerEP++;
-        showSteerEP();
-      }
-
-    } else if (menuLevel == MENU_EP_THROTTLE) {
-      // --------- THROTTLE EP SUBMENU ---------
-
-      // BACK → return to top menu
-      if (DRE(backPressed, backButtonState)) {
-        menuLevel = MENU_TOP;
-        Serial.println("\nBack to MAIN MENU");
-        showTopMenu();
-      }
-
-      // LEFT → -1%
-      if (DRE(leftPressed, leftButtonState)) {
-        if (throttleEP > 0) throttleEP--;
-        showThrottleEP();
-      }
-
-      // RIGHT → +1%
-      if (DRE(rightPressed, rightButtonState)) {
-        if (throttleEP < 125) throttleEP++;
-        showThrottleEP();
       }
     }
   }
 
-  // No delay() needed – DRE + loop speed handles debounce
+  // ---------- SUBTRIM LIST ----------
+  else if (menuLevel == MENU_SUBTRIM_LIST) {
+    if (DRE(B, backButtonState)) {
+      menuLevel = MENU_TOP;
+      showTopMenu();
+    }
+    if (DRE(R, rightButtonState)) {
+      chIndex = (chIndex + 1) % NUM_CHANNELS;
+      showSubtrimList();
+    }
+    if (DRE(L, leftButtonState)) {
+      chIndex = (chIndex + NUM_CHANNELS - 1) % NUM_CHANNELS;
+      showSubtrimList();
+    }
+    if (DRE(S, selButtonState)) {
+      menuLevel = MENU_SUBTRIM_EDIT;
+      showSubtrimEdit();
+    }
+  }
+
+  // ---------- SUBTRIM EDIT ----------
+  else if (menuLevel == MENU_SUBTRIM_EDIT) {
+    if (DRE(B, backButtonState)) {
+      menuLevel = MENU_SUBTRIM_LIST;
+      showSubtrimList();
+    }
+    if (DRE(R, rightButtonState)) {
+      if (chSubtrim[chIndex] < 100) chSubtrim[chIndex]++;
+      showSubtrimEdit();
+    }
+    if (DRE(L, leftButtonState)) {
+      if (chSubtrim[chIndex] > -100) chSubtrim[chIndex]--;
+      showSubtrimEdit();
+    }
+  }
 }
